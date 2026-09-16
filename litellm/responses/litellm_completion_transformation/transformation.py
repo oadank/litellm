@@ -83,11 +83,17 @@ class ChatCompletionSession(TypedDict, total=False):
 # function_calls back to Responses FunctionCall (Codex routes via the separate
 # `namespace` field, not a flattened mcp__server__tool name).
 _NS_TOOL_NAMES: Dict[str, Tuple[str, str]] = {}
+# short_name -> {full_name,...}. Some chat backends (Aliyun qwen) intermittently
+# drop the mcp__<server>__ prefix and reply with only the bare short name; when
+# that short name maps 1:1 to a namespace this session, rebuild (ns, short) so
+# codex's tool router can resolve it instead of "unsupported call".
+_NS_SHORT_TO_FULL: Dict[str, Set[str]] = {}
 
 
 def _register_ns_tool(full_name: str, namespace: str, short_name: str) -> None:
     if full_name and namespace and short_name:
         _NS_TOOL_NAMES[full_name] = (namespace, short_name)
+        _NS_SHORT_TO_FULL.setdefault(short_name, set()).add(full_name)
 
 
 def split_ns_tool_name(name: str) -> Tuple[Optional[str], str]:
@@ -97,6 +103,13 @@ def split_ns_tool_name(name: str) -> Tuple[Optional[str], str]:
     hit = _NS_TOOL_NAMES.get(name)
     if hit:
         return hit
+    # Bare short name returned by backend that stripped the prefix.
+    if not name.startswith("mcp__"):
+        fulls = _NS_SHORT_TO_FULL.get(name)
+        if fulls and len(fulls) == 1:
+            entry = _NS_TOOL_NAMES.get(next(iter(fulls)))
+            if entry:
+                return entry
     return None, name
 
 
