@@ -3,6 +3,7 @@ Handles transforming from Responses API -> LiteLLM completion  (Chat Completion 
 """
 
 from collections.abc import Sequence
+import os as _os
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union, cast
 
 from openai.types.responses import ResponseFunctionToolCall
@@ -1673,11 +1674,23 @@ class LiteLLMCompletionResponsesConfig:
                 full_name = full_name[:64]
             _register_ns_tool(full_name, ns_name, raw_name)
             tool_desc = (nt.get("description") or "").strip()
-            if ns_desc and ns_desc.lower() not in tool_desc.lower():
-                ns_snippet = ns_desc if len(ns_desc) <= 1200 else ns_desc[:1200] + "..."
-                merged = f"[{ns_name}] {ns_snippet}\n\n{tool_desc}".strip()
+            # Description 截短：整包 tools 从 ~39K tok 降到 ~20K tok。阿里云
+            # Throttling.BurstRate 是「请求数突增」熔断（非 quota归零：单发直连 200）;
+            # 体小 + litellm 队列双重消峰。LITELLM_MCP_TOOL_DESC_CAP 可调; name/schema
+            # 不动调用能力还在（anysearch 路由实测 OK）。
+            ns_tag = f"[{ns_name}] " if ns_name else ""
+            if not tool_desc and ns_desc:
+                tool_desc = ns_desc
+            raw_full = ns_tag + tool_desc
+            _cap_str = (_os.environ.get("LITELLM_MCP_TOOL_DESC_CAP") or "420").strip()
+            try:
+                _cap = max(60, int(_cap_str))
+            except ValueError:
+                _cap = 420
+            if len(raw_full) <= _cap:
+                merged = raw_full
             else:
-                merged = tool_desc
+                merged = raw_full[: _cap - 1].rstrip() + "…"
             out.append(
                 LiteLLMCompletionResponsesConfig._responses_function_tool_to_chat_completion_tool(
                     nt,
