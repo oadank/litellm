@@ -78,6 +78,28 @@ class ChatCompletionSession(TypedDict, total=False):
 ########### End of Initialize Classes used for Responses API  ###########
 
 
+# Codex 0.146+ MCP: full_name -> (namespace, short_name).
+# Populated when flattening type=namespace tools; used when converting chat
+# function_calls back to Responses FunctionCall (Codex routes via the separate
+# `namespace` field, not a flattened mcp__server__tool name).
+_NS_TOOL_NAMES: Dict[str, Tuple[str, str]] = {}
+
+
+def _register_ns_tool(full_name: str, namespace: str, short_name: str) -> None:
+    if full_name and namespace and short_name:
+        _NS_TOOL_NAMES[full_name] = (namespace, short_name)
+
+
+def split_ns_tool_name(name: str) -> Tuple[Optional[str], str]:
+    """Split a flattened MCP function name into (namespace, short_name)."""
+    if not name:
+        return None, name
+    hit = _NS_TOOL_NAMES.get(name)
+    if hit:
+        return hit
+    return None, name
+
+
 class LiteLLMCompletionResponsesConfig:
     @staticmethod
     def _clean_schema(obj: Any) -> Any:
@@ -1553,6 +1575,108 @@ class LiteLLMCompletionResponsesConfig:
         return ChatCompletionSystemMessage(role="system", content=instructions or "")
 
     @staticmethod
+    def _responses_function_tool_to_chat_completion_tool(
+        tool: Dict[str, Any],
+        *,
+        name_override: Optional[str] = None,
+        description_override: Optional[str] = None,
+        is_domestic_model: bool = False,
+    ) -> ChatCompletionToolParam:
+        """Wrap a Responses-style flat function tool as a Chat Completions tool."""
+        parameters = dict(tool.get("parameters", {}) or {})
+        if not parameters or "type" not in parameters:
+            parameters["type"] = "object"
+        name = name_override if name_override is not None else (tool.get("name") or "")
+        description = (
+            description_override
+            if description_override is not None
+            else (tool.get("description") or "")
+        )
+        chat_completion_tool: Dict[str, Any]
+        if is_domestic_model:
+            parameters = LiteLLMCompletionResponsesConfig._clean_schema(parameters)
+            chat_completion_tool = {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                },
+            }
+        else:
+            chat_completion_tool = {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                    "strict": tool.get("strict", False) or False,
+                },
+            }
+            if tool.get("cache_control"):
+                chat_completion_tool["cache_control"] = tool.get("cache_control")  # type: ignore
+            if tool.get("defer_loading"):
+                chat_completion_tool["defer_loading"] = tool.get("defer_loading")  # type: ignore
+            if tool.get("allowed_callers"):
+                chat_completion_tool["allowed_callers"] = tool.get("allowed_callers")  # type: ignore
+            if tool.get("input_examples"):
+                chat_completion_tool["input_examples"] = tool.get("input_examples")  # type: ignore
+        return cast(ChatCompletionToolParam, chat_completion_tool)
+
+    @staticmethod
+    def _flatten_responses_namespace_tool(
+        tool: Dict[str, Any],
+        is_domestic_model: bool = True,
+    ) -> List[ChatCompletionToolParam]:
+        """
+        Flatten a Responses `type=namespace` tool into Chat Completions function tools.
+
+        Codex 0.146+ sends local MCP servers as namespaces. Chat backends only
+        accept OpenAI `function` tools, so each nested tool becomes
+        `mcp__<server>__<tool>`. On the way back, FunctionCall.namespace + name
+        is restored for Codex's tool router.
+        """
+        ns_name = tool.get("name") or ""
+        ns_desc = (tool.get("description") or "").strip()
+        nested = tool.get("tools") or []
+        if not isinstance(nested, list):
+            return []
+        out: List[ChatCompletionToolParam] = []
+        for nt in nested:
+            if not isinstance(nt, dict):
+                continue
+            if nt.get("type") not in (None, "function"):
+                continue
+            raw_name = nt.get("name") or ""
+            if not raw_name:
+                continue
+            if raw_name.startswith("mcp__") or ns_name.startswith("mcp__"):
+                full_name = (
+                    raw_name if raw_name.startswith("mcp__") else f"{ns_name}__{raw_name}"
+                )
+            else:
+                full_name = f"{ns_name}__{raw_name}" if ns_name else raw_name
+            if len(full_name) > 64:
+                full_name = full_name[:64]
+            _register_ns_tool(full_name, ns_name, raw_name)
+            tool_desc = (nt.get("description") or "").strip()
+            if ns_desc and ns_desc.lower() not in tool_desc.lower():
+                ns_snippet = ns_desc if len(ns_desc) <= 1200 else ns_desc[:1200] + "..."
+                merged = f"[{ns_name}] {ns_snippet}\n\n{tool_desc}".strip()
+            else:
+                merged = tool_desc
+            out.append(
+                LiteLLMCompletionResponsesConfig._responses_function_tool_to_chat_completion_tool(
+                    nt,
+                    name_override=full_name,
+                    description_override=merged,
+                    is_domestic_model=is_domestic_model,
+                )
+            )
+        return out
+
+
+    @staticmethod
     def transform_responses_api_tools_to_chat_completion_tools(
         tools: Optional[List[Union[FunctionToolParam, OpenAIMcpServerTool]]],
         model_name: Optional[str] = None,
@@ -1581,12 +1705,26 @@ class LiteLLMCompletionResponsesConfig:
         web_search_options: Optional[OpenAIWebSearchOptions] = None
 
         for tool in tools:
+            # Codex 0.146+ 本机 MCP 发成 type=namespace；展平成 function，不能丢
+            if tool.get("type") == "namespace":
+                if is_domestic_model:
+                    chat_completion_tools.extend(
+                        LiteLLMCompletionResponsesConfig._flatten_responses_namespace_tool(
+                            cast(Dict[str, Any], tool)
+                        )
+                    )
+                else:
+                    # 非国内模型：透传原样（上游可能原生支持 namespace）
+                    chat_completion_tools.append(
+                        cast(Union[ChatCompletionToolParam, OpenAIMcpServerTool], tool)
+                    )
+                continue
+
             # 只对国内模型 endpoint 过滤不支持的工具类型
             # 国内模型只支持 type: "function"，不支持 Codex/OpenAI 特有的工具类型
             if is_domestic_model:
                 unsupported_tool_types = [
                     "local_shell",  # Codex CLI 内置 Shell 工具
-                    "namespace",  # Codex CLI 0.130.0 工具命名空间
                     "code_interpreter",  # OpenAI Code Interpreter
                     "file_search",  # OpenAI File Search
                     "computer_use",  # Anthropic Computer Use

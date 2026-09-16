@@ -6,6 +6,7 @@ import litellm
 from litellm.main import stream_chunk_builder
 from litellm.responses.litellm_completion_transformation.transformation import (
     LiteLLMCompletionResponsesConfig,
+    split_ns_tool_name,
 )
 from litellm.responses.streaming_iterator import ResponsesAPIStreamingIterator
 from litellm.responses.utils import ResponsesAPIRequestUtils
@@ -206,19 +207,21 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             if call_id not in self._tool_args_by_call_id:
                 self._tool_args_by_call_id[call_id] = ""
                 self._sequence_number += 1
+                ns, short_name = split_ns_tool_name(fn_name)
+                item_payload: Dict[str, Any] = {
+                    "type": "function_call",
+                    "id": call_id,
+                    "call_id": call_id,
+                    "name": short_name,
+                    "arguments": "",
+                    "status": "in_progress",
+                }
+                if ns:
+                    item_payload["namespace"] = ns
                 event = OutputItemAddedEvent(
                     type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
                     output_index=output_index,
-                    item=BaseLiteLLMOpenAIResponseObject(
-                        **{
-                            "type": "function_call",
-                            "id": call_id,
-                            "call_id": call_id,
-                            "name": fn_name,
-                            "arguments": "",
-                            "status": "in_progress",
-                        }
-                    ),
+                    item=BaseLiteLLMOpenAIResponseObject(**item_payload),
                 )
                 event.__dict__["sequence_number"] = self._sequence_number
                 self._pending_tool_events.append(event)
@@ -293,19 +296,21 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             if is_new_tool_call:
                 self._tool_args_by_call_id[call_id] = ""
                 self._sequence_number += 1
+                ns, short_name = split_ns_tool_name(fn_name)
+                item_payload: Dict[str, Any] = {
+                    "type": "function_call",
+                    "id": call_id,
+                    "call_id": call_id,
+                    "name": short_name,
+                    "arguments": "",
+                    "status": "in_progress",
+                }
+                if ns:
+                    item_payload["namespace"] = ns
                 event = OutputItemAddedEvent(
                     type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
                     output_index=output_index,
-                    item=BaseLiteLLMOpenAIResponseObject(
-                        **{
-                            "type": "function_call",
-                            "id": call_id,
-                            "call_id": call_id,
-                            "name": fn_name,
-                            "arguments": "",
-                            "status": "in_progress",
-                        }
-                    ),
+                    item=BaseLiteLLMOpenAIResponseObject(**item_payload),
                 )
                 event.__dict__["sequence_number"] = self._sequence_number
                 self._pending_tool_events.append(event)
@@ -343,20 +348,22 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             self._pending_tool_events.append(done_event)
 
             self._sequence_number += 1
+            ns_done, short_name_done = split_ns_tool_name(fn_name)
+            done_payload: Dict[str, Any] = {
+                "type": "function_call",
+                "id": call_id,
+                "call_id": call_id,
+                "name": short_name_done,
+                "arguments": final_args,
+                "status": "completed",
+            }
+            if ns_done:
+                done_payload["namespace"] = ns_done
             item_done_event = OutputItemDoneEvent(
                 type=ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
                 output_index=output_index,
                 sequence_number=self._sequence_number,
-                item=BaseLiteLLMOpenAIResponseObject(
-                    **{
-                        "type": "function_call",
-                        "id": call_id,
-                        "call_id": call_id,
-                        "name": fn_name,
-                        "arguments": final_args,
-                        "status": "completed",
-                    }
-                ),
+                item=BaseLiteLLMOpenAIResponseObject(**done_payload),
             )
             self._pending_tool_events.append(item_done_event)
 
